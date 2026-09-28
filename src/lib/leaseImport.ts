@@ -11,6 +11,9 @@
 //   5. 任一冲突禁止应用；全部通过后由调用方一次性替换状态（原子应用）；
 //   6. CSV 语法（引号规则）严格校验：任一语法错误即整批拒绝——禁用应用、
 //      保持既有登记不变、迁移编排停止生成；修正文本后自动恢复。
+//   7. 仅「真正空白」的物理行（无任何非空白字符、无分隔符、无引号）才忽略；
+//      含分隔符（如合法行后误粘的 ,,,）或带引号的行即使字段全空也是数据行，
+//      保留其原物理行号交由字段校验逐字段报缺失，任一此类错误行同样阻止整批应用。
 //
 // 本模块与其他生成模块一样只读规划与既有登记，绝不修改规划、基线、路由汇总与导出。
 
@@ -55,7 +58,9 @@ export interface CsvParseResult {
  *     报告首个错误的物理行与列（均从 1 开始，未闭合引号定位到开引号）；
  *   - 引号包裹的字段可含逗号与换行，"" 转义为一个双引号；
  *   - CRLF 算一次换行；引号内单独的 CR / LF 原样保留换行内容；
- *   - 跳过完全空白的物理行；自动去除 BOM。
+ *   - 只跳过真正空白的物理行（无分隔符、无引号、无任何非空白字符）；
+ *     含分隔符（哪怕只写了 ,,,）或带引号（哪怕是空字段 ""）的行仍是数据行，
+ *     保留原物理行号，交给上层逐字段报缺失；自动去除 BOM。
  */
 export function parseCsv(input: string): CsvParseResult {
   const text = input.replace(/^\uFEFF/, '') // 去除 BOM
@@ -66,6 +71,9 @@ export function parseCsv(input: string): CsvParseResult {
   let line = 1
   let column = 1 // 当前字符的列号（从 1 开始）
   let hasContent = false // 当前记录是否出现过任何非空白内容（引号字段本身也算内容）
+  // 当前物理行是否出现过字段分隔符：出现即说明是显式写出的数据行
+  // （如误粘的 ,,,），即使所有字段全空也不得按空白行丢弃
+  let sawDelimiter = false
   // 字段状态机：fieldStart（字段首位）→ inQuotes / inField；闭引号后进入 afterQuote
   let state: 'fieldStart' | 'inField' | 'inQuotes' | 'afterQuote' = 'fieldStart'
   // 开引号位置（未闭合引号错误定位用）
@@ -79,9 +87,12 @@ export function parseCsv(input: string): CsvParseResult {
   }
   function endRecord() {
     pushField()
-    if (hasContent) records.push({ line: recordStart, cells })
+    // 仅真正空白的物理行才忽略：有分隔符或引号（hasContent 已涵盖引号）
+    // 的行即便字段全空也是数据行，保留记录与原物理行号
+    if (hasContent || sawDelimiter) records.push({ line: recordStart, cells })
     cells = []
     hasContent = false
+    sawDelimiter = false
     recordStart = line + 1
     state = 'fieldStart' // 记录结束后回到字段首位状态
   }
@@ -121,6 +132,7 @@ export function parseCsv(input: string): CsvParseResult {
       // 闭引号后只允许逗号、换行或文件结束
       if (ch === ',') {
         pushField()
+        sawDelimiter = true
         state = 'fieldStart'
         column++
         continue
@@ -140,6 +152,7 @@ export function parseCsv(input: string): CsvParseResult {
       }
       if (ch === ',') {
         pushField()
+        sawDelimiter = true
         column++
         continue
       }
@@ -156,6 +169,7 @@ export function parseCsv(input: string): CsvParseResult {
     }
     if (ch === ',') {
       pushField()
+      sawDelimiter = true
       state = 'fieldStart'
       column++
       continue

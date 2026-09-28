@@ -267,7 +267,9 @@ export default function LeaseImportPanel({
       {!planPaused && !hasCsv && !invalid && (
         <p className="summary-empty">
           尚未粘贴 CSV。可点击「填入示例 CSV」参考格式；支持引号包裹的字段（字段内可含逗号与换行），
-          引号必须出现在字段首位、闭引号后只允许逗号或换行，空行会被忽略。
+          引号必须出现在字段首位、闭引号后只允许逗号或换行；只有真正空白的物理行会被忽略——
+          只含分隔符（如误粘的 <code className="mono">,,,</code>）或带引号空字段的行仍是数据行，
+          会按物理行号逐字段报缺失并阻止应用。
           导入只更新主机登记，不影响规划、基线、路由汇总与 JSON 导出。
         </p>
       )}

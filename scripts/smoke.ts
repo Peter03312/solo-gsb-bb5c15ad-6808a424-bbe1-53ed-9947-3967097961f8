@@ -2120,6 +2120,62 @@ check('空选择 / 已删除需求解析为 null', resolvePoolSegment(hostPlan, 
   check('裸引号整批拒绝且迁移清单停止生成', !built.canApply && buildMigrationPlan(built, [], hostPlan).steps.length === 0)
 }
 
+// 22a6) 漏检回归：合法行后误粘 ,,, —— 含分隔符的空字段行仍是数据行，
+// 必须保留原物理行号、逐字段报缺失并阻止整批应用（不得只预览合法行并允许应用）
+{
+  const existing: HostAssignment[] = [
+    { id: 'keep', ownerId: 'q4', name: '留守', address: ipToInt('192.168.10.18'), mode: 'manual', mac: 'aa:bb:cc:00:00:09' },
+  ]
+  const text = [
+    '网段 CIDR,设备名,IPv4,MAC',
+    '192.168.10.16/30,管理A,192.168.10.17,aa:bb:cc:00:00:01',
+    ',,,', // 合法数据行后误粘的分隔符行：4 个空字段
+  ].join('\n')
+
+  // 解析层：,,, 是含分隔符的数据行，不得按空白行丢弃；物理行号保留为 3
+  const parsed = parseCsv(text)
+  check('误粘 ,,, 无语法错误但被保留为记录', parsed.error === null && parsed.records.length === 3, JSON.stringify(parsed))
+  check(',,, 行保留原物理行号（3）且含 4 个空字段', parsed.records[2].line === 3 && parsed.records[2].cells.length === 4 && parsed.records[2].cells.every((c) => c === ''), JSON.stringify(parsed.records[2]))
+  // 部分分隔符（如 ",,"）同样保留；空白加逗号也算数据行
+  const partials = parseCsv('h\n,,\n  , \n')
+  check('部分分隔符行 / 空白带逗号行均保留为数据行', partials.records.length === 3 && partials.records.map((x) => x.line).join(',') === '1,2,3', JSON.stringify(partials.records))
+  // 真正空白的物理行仍忽略（保持既有行为）
+  check('真正空白的物理行仍忽略', parseCsv('a,b\n\n   \t \n').records.length === 1, JSON.stringify(parseCsv('a,b\n\n   \t \n').records))
+  // 带引号的空字段行（"",,）也是数据行
+  const quoted = parseCsv('h\n"",,\n')
+  check('带引号空字段行保留为数据行且物理行号为 2', quoted.records.length === 2 && quoted.records[1].line === 2 && quoted.records[1].cells[0] === '', JSON.stringify(quoted.records))
+
+  // 预览层：合法行 + 错误行同时出现在预览；错误行逐字段提示四项缺失
+  const built = buildLeaseImport(text, existing, hostPlan, () => 'x')
+  check('预览含 2 条数据行（合法行未被错误行吞掉）', built.rows.length === 2, JSON.stringify(built.counts))
+  check('合法行仍正常判定为新增', built.rows[0].status === 'add' && built.rows[0].errors.length === 0, JSON.stringify(built.rows[0]))
+  const badRow = built.rows[1]
+  check('错误行保留物理行号 3、录入序号 2', badRow.line === 3 && badRow.index === 2, JSON.stringify(badRow))
+  check('错误行状态为冲突且逐字段提示四项缺失', badRow.status === 'conflict' && badRow.errors.length === 4 && /缺少网段 CIDR/.test(badRow.errors[0]) && badRow.errors.some((m) => /缺少设备名/.test(m)) && badRow.errors.some((m) => /缺少IPv4/.test(m)) && badRow.errors.some((m) => /缺少MAC/.test(m)), JSON.stringify(badRow.errors))
+  check('任一错误行禁止整批应用', !built.canApply && built.hasConflicts && built.counts.conflict === 1)
+  check('禁止应用时既有登记保持原样（未被部分改写）', built.merged.length === 1 && built.merged[0].id === 'keep' && built.merged[0].name === '留守' && built.merged[0].address === ipToInt('192.168.10.18'), JSON.stringify(built.merged))
+  check('addCount/updateCount 均为 0', built.addCount === 0 && built.updateCount === 0)
+  const mp = buildMigrationPlan(built, existing, hostPlan)
+  check('错误行存在时迁移编排无执行步骤（pending）', !mp.ok && mp.steps.length === 0 && mp.blockers[0]?.kind === 'pending')
+
+  // 改正（删除误粘行）后正常恢复
+  const fixedText = [
+    '网段 CIDR,设备名,IPv4,MAC',
+    '192.168.10.16/30,管理A,192.168.10.17,aa:bb:cc:00:00:01',
+  ].join('\n')
+  const fixed = buildLeaseImport(fixedText, existing, hostPlan, () => 'x')
+  check('删除 ,,, 后恢复：1 行新增、可应用、迁移可编排', fixed.canApply && fixed.counts.add === 1 && fixed.counts.conflict === 0 && buildMigrationPlan(fixed, existing, hostPlan).ok, JSON.stringify(fixed.counts))
+
+  // 把 ,,, 补成完整合法行同样恢复
+  const textNoKeep = [
+    '网段 CIDR,设备名,IPv4,MAC',
+    '192.168.10.16/30,管理A,192.168.10.17,aa:bb:cc:00:00:01',
+    '192.168.10.16/30,管理B,192.168.10.18,aa:bb:cc:00:00:02',
+  ].join('\n')
+  const completed = buildLeaseImport(textNoKeep, [], hostPlan, () => 'x')
+  check('补全空字段行后恢复可应用（2 行新增）', completed.canApply && completed.counts.add === 2, JSON.stringify(completed.rows.map((r) => r.errors)))
+}
+
 // 22b) 表头映射：别名、列顺序不限；缺列 / 重复列报错
 {
   const ok = mapHeader({ line: 1, cells: ['mac', 'ip地址', '名称', '子网'] })
