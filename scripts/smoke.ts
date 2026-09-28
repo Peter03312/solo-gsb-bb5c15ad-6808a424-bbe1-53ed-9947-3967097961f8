@@ -2120,6 +2120,68 @@ check('空选择 / 已删除需求解析为 null', resolvePoolSegment(hostPlan, 
   check('裸引号整批拒绝且迁移清单停止生成', !built.canApply && buildMigrationPlan(built, [], hostPlan).steps.length === 0)
 }
 
+// 22a6) 记录判定：仅真正空白的物理行可忽略；含分隔符或引号空字段的行仍是数据行
+{
+  // 复现漏检：合法行后粘贴 ,,, 旧实现把它当空白行吞掉
+  const r1 = parseCsv(',,,')
+  check('仅分隔符的行（,,,）解析为 1 条记录而非空白行', r1.error === null && r1.records.length === 1 && r1.records[0].line === 1, JSON.stringify(r1))
+  check(',,, 记录含 4 个空字段', r1.records[0]?.cells.length === 4 && r1.records[0]?.cells.every((c) => c === ''))
+  check('单个逗号也是数据行（2 个空字段）', parseCsv(',').records.length === 1 && parseCsv(',').records[0].cells.length === 2)
+  // 引号包裹的空字段（含带逗号的整行）同样保留
+  const r2 = parseCsv('""\n"","",,\n')
+  check('引号空字段行保留（2 条记录）', r2.error === null && r2.records.length === 2, JSON.stringify(r2))
+  check('引号空字段保留原物理行号（1、2）', r2.records[0]?.line === 1 && r2.records[1]?.line === 2)
+  check('第二行为 4 个空字段（含两个引号空字段）', r2.records[1]?.cells.length === 4 && r2.records[1]?.cells.every((c) => c === ''))
+  // 空白 + 分隔符（如 "  ,  "）不是空白物理行
+  const r3 = parseCsv('  ,  \n')
+  check('仅空白与逗号的行保留为数据行', r3.records.length === 1 && r3.records[0]?.line === 1, JSON.stringify(r3))
+  // 真正空白的物理行仍忽略；夹在数据行之间时物理行号不被压缩
+  const r4 = parseCsv('网段 CIDR,设备名,IPv4,MAC\n\t\n192.168.10.16/30,A,192.168.10.17,aa:bb:cc:00:00:01')
+  check('夹在中间的纯空白物理行仍忽略（2 条记录）', r4.records.length === 2, JSON.stringify(r4.records))
+  check('空白行不压缩后续数据行物理行号（数据行在第 3 行）', r4.records[1]?.line === 3, r4.records.map((x) => x.line).join(','))
+  check('纯空白文本仍解析为空记录', parseCsv('  \n \n\t\r\n').records.length === 0)
+}
+
+// 22a7) 端到端：合法行后粘贴 ,,, -> 预览多出冲突行、整批禁止应用、登记不变、迁移无步骤；改正后恢复
+{
+  const existing: HostAssignment[] = [
+    { id: 'keep', ownerId: 'q1', name: '既有设备', address: ipToInt('192.168.10.200'), mode: 'manual', mac: 'aa:bb:cc:99:99:99' },
+  ]
+  const csv = [
+    '网段 CIDR,设备名,IPv4,MAC',
+    '192.168.10.16/30,管理设备A,192.168.10.17,aa:bb:cc:00:00:01',
+    '192.168.10.16/30,管理设备B,192.168.10.18,aa:bb:cc:00:00:02',
+    ',,,', // 漏检行：含分隔符的空字段行，必须被识别为冲突数据行
+  ].join('\n')
+  const built = buildLeaseImport(csv, existing, hostPlan, () => 'x')
+  check('漏检行进入逐行预览（3 条数据行）', built.rows.length === 3, JSON.stringify(built.counts))
+  const badRow = built.rows[2]
+  check('漏检行保留原物理行号（第 4 行）与录入序号（第 3 行）', badRow.line === 4 && badRow.index === 3, JSON.stringify({ line: badRow.line, index: badRow.index }))
+  check('漏检行判冲突且逐字段提示四个缺失', badRow.status === 'conflict' && badRow.errors.length === 4 &&
+    /缺少网段 CIDR/.test(badRow.errors[0]) && /缺少设备名/.test(badRow.errors.join(' ')) && /缺少IPv4/.test(badRow.errors.join(' ')) && /缺少MAC/.test(badRow.errors.join(' ')),
+    JSON.stringify(badRow.errors))
+  check('前两合法行仍标记为新增', built.rows[0].status === 'add' && built.rows[1].status === 'add')
+  check('任一错误行阻止整批应用', !built.canApply && built.hasConflicts && built.counts.conflict === 1 && built.counts.add === 2, JSON.stringify(built.counts))
+  check('阻止应用时既有登记原样保留（merged 不变）', built.merged.length === 1 && built.merged[0].id === 'keep' && built.merged[0].name === '既有设备')
+  const mp = buildMigrationPlan(built, existing, hostPlan)
+  check('错误行存在时迁移编排无执行步骤（pending）', !mp.ok && mp.steps.length === 0 && mp.blockers[0]?.kind === 'pending')
+  // 改正（删除 ,,, 行）后自动恢复
+  const fixed = buildLeaseImport(csv.replace('\n,,,', ''), existing, hostPlan, (() => {
+    let n = 0
+    return () => `fix-${++n}`
+  })())
+  check('删除漏检行后恢复可应用（2 新增 + 既有登记共 3 条）', fixed.canApply && fixed.counts.add === 2 && fixed.merged.length === 3, JSON.stringify(fixed.counts))
+  check('恢复后迁移编排重新生成（2 个新增上线步骤）', buildMigrationPlan(fixed, existing, hostPlan).ok === true &&
+    buildMigrationPlan(fixed, existing, hostPlan).steps.filter((s) => s.kind === 'add').length === 2)
+  // 纯空白物理行（而非 ,,,）仍被忽略：不阻止应用
+  const withBlank = [
+    '网段 CIDR,设备名,IPv4,MAC',
+    '192.168.10.16/30,管理设备A,192.168.10.17,aa:bb:cc:00:00:01',
+    '   ',
+  ].join('\n')
+  check('真正空白的物理行仍忽略且可应用', buildLeaseImport(withBlank, existing, hostPlan, () => 'x').canApply)
+}
+
 // 22b) 表头映射：别名、列顺序不限；缺列 / 重复列报错
 {
   const ok = mapHeader({ line: 1, cells: ['mac', 'ip地址', '名称', '子网'] })

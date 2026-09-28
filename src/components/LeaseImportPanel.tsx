@@ -100,6 +100,8 @@ export default function LeaseImportPanel({
         <span className="lease-status conflict"> 冲突 </span>
         。<strong>任一冲突即禁止应用</strong>，全部通过后一次性替换登记状态。引号语法严格校验
         （引号仅在字段首位、闭引号后仅允许逗号 / 换行），<strong>首个语法错误按物理行、列定位并整批拒绝</strong>。
+        <strong>只有完全空白（无逗号、无引号）的物理行才会被忽略</strong>；像 <code className="mono">,,,</code>、<code className="mono">""</code>
+        这样含分隔符或引号空字段的行仍是数据行，会保留原物理行号并逐字段提示缺失、同样阻止整批应用。
         规划变化后原始 CSV 保留、预览自动重算。
       </p>
 
@@ -267,7 +269,8 @@ export default function LeaseImportPanel({
       {!planPaused && !hasCsv && !invalid && (
         <p className="summary-empty">
           尚未粘贴 CSV。可点击「填入示例 CSV」参考格式；支持引号包裹的字段（字段内可含逗号与换行），
-          引号必须出现在字段首位、闭引号后只允许逗号或换行，空行会被忽略。
+          引号必须出现在字段首位、闭引号后只允许逗号或换行；完全空白的物理行会被忽略，
+          但含逗号（如 <code className="mono">,,,</code>）或引号空字段（如 <code className="mono">""</code>）的行仍是数据行并逐字段报缺失。
           导入只更新主机登记，不影响规划、基线、路由汇总与 JSON 导出。
         </p>
       )}
